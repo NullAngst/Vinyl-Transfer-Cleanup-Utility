@@ -10,7 +10,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import numpy as np
 from scipy.io import wavfile
-from scipy.signal import butter, filtfilt, medfilt, stft, istft, bilinear_zpk, zpk2tf
+from scipy.signal import butter, filtfilt, stft, istft, bilinear_zpk, zpk2tf
 from scipy.ndimage import binary_dilation
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -18,6 +18,11 @@ from matplotlib.widgets import SpanSelector
 import threading
 import os
 import traceback
+
+# NOTE: scipy.signal.medfilt is intentionally NOT imported.
+# It has a known heap-corruption bug when called repeatedly, causing
+# "free(): invalid size" crashes. All median filtering is done via
+# numpy or scipy.ndimage instead.
 
 try:
     import sounddevice as sd
@@ -31,8 +36,6 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 class Tooltip:
-    """Hover tooltip for any tkinter widget."""
-
     def __init__(self, widget, text):
         self.widget = widget
         self.text = text
@@ -48,12 +51,11 @@ class Tooltip:
         self._tw = tk.Toplevel(self.widget)
         self._tw.wm_overrideredirect(True)
         self._tw.wm_geometry(f"+{x}+{y}")
-        lbl = tk.Label(
+        tk.Label(
             self._tw, text=self.text, justify=tk.LEFT,
             background="#ffffcc", relief="solid", borderwidth=1,
-            font=("Arial", 9), wraplength=300, padx=6, pady=4
-        )
-        lbl.pack()
+            font=("Arial", 9), wraplength=320, padx=6, pady=4
+        ).pack()
 
     def _hide(self, _event=None):
         if self._tw:
@@ -62,7 +64,6 @@ class Tooltip:
 
 
 def tip(widget, text):
-    """Attach a tooltip and return the widget (for one-liners)."""
     Tooltip(widget, text)
     return widget
 
@@ -78,20 +79,17 @@ class VinylCleanupApp:
         self.root.geometry("1200x820")
         self.root.minsize(960, 660)
 
-        # Audio state
         self.filepath = None
-        self.audio_data = None          # original, never mutated
+        self.audio_data = None        # original, never mutated
         self.sample_rate = None
-        self.processed_data = None      # result of full-track processing
-        self.preview_data = None        # result of region preview
+        self.processed_data = None    # full-track result
+        self.preview_data = None      # region preview result
         self.noise_profile = None
         self.undo_stack = []
 
-        # Region selection state (seconds)
-        self.region_start = None
+        self.region_start = None      # seconds
         self.region_end = None
 
-        # Playback
         self.is_playing = False
 
         self._setup_ui()
@@ -101,7 +99,6 @@ class VinylCleanupApp:
     # -----------------------------------------------------------------------
 
     def _setup_ui(self):
-        # Top info bar
         info_bar = ttk.Frame(self.root, padding=(10, 4))
         info_bar.pack(side=tk.TOP, fill=tk.X)
         self.lbl_file_info = ttk.Label(info_bar, text="No file loaded", font=("Courier", 10))
@@ -109,18 +106,15 @@ class VinylCleanupApp:
         self.lbl_status = ttk.Label(info_bar, text="Ready", foreground="gray")
         self.lbl_status.pack(side=tk.RIGHT, padx=10)
 
-        # Bottom action bar
         bottom_bar = ttk.Frame(self.root, padding=(10, 6))
         bottom_bar.pack(side=tk.BOTTOM, fill=tk.X)
         self._build_bottom_bar(bottom_bar)
 
-        # Main split
         main_pane = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
         main_pane.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
         left_frame = ttk.Frame(main_pane, padding=5)
         main_pane.add(left_frame, weight=1)
-
         right_frame = ttk.Frame(main_pane, padding=5)
         main_pane.add(right_frame, weight=3)
 
@@ -134,19 +128,17 @@ class VinylCleanupApp:
         self.btn_preview = tip(
             ttk.Button(bar, text="Process Preview Region",
                        command=self.start_preview, state=tk.DISABLED),
-            "Process ONLY the highlighted region on the waveform (or the time range you typed).\n"
-            "Much faster than a full run. Use this to test settings before committing to the whole file.\n\n"
-            "Select a region first by clicking and dragging on the top waveform, or by typing a range."
+            "Process ONLY the selected region — much faster than a full run.\n"
+            "Select a region by dragging on the top waveform, or type a range.\n\n"
+            "Use this to dial in settings before committing to the whole file."
         )
         self.btn_preview.pack(side=tk.LEFT, padx=3)
 
         self.btn_apply_full = tip(
             ttk.Button(bar, text="Apply to Full Track",
                        command=self.start_full_processing, state=tk.DISABLED),
-            "Apply the current settings to the ENTIRE file from start to finish.\n"
-            "Only do this after you are happy with how the preview sounds.\n\n"
-            "This always processes from the original — running it again with different\n"
-            "settings just replaces the previous result."
+            "Apply the current settings to the ENTIRE file.\n"
+            "Always processes from the original — re-running replaces the previous result."
         )
         self.btn_apply_full.pack(side=tk.LEFT, padx=3)
 
@@ -155,23 +147,22 @@ class VinylCleanupApp:
         self.btn_save = tip(
             ttk.Button(bar, text="Save Processed WAV",
                        command=self.save_file, state=tk.DISABLED),
-            "Export the full-track processed audio to a new WAV file.\n"
-            "The original file is never modified. Only available after 'Apply to Full Track'."
+            "Export the full-track result to a new WAV file.\n"
+            "Only available after 'Apply to Full Track'.\n"
+            "The original file is never modified."
         )
         self.btn_save.pack(side=tk.LEFT, padx=3)
 
         self.btn_undo = tip(
             ttk.Button(bar, text="Undo", command=self.undo, state=tk.DISABLED),
-            "Step back to the previous full-track processed result.\n"
-            "Keeps up to 10 levels of history."
+            "Step back to the previous full-track result. Keeps up to 10 levels."
         )
         self.btn_undo.pack(side=tk.LEFT, padx=3)
 
         self.btn_reset = tip(
             ttk.Button(bar, text="Reset to Original",
                        command=self.reset_to_original, state=tk.DISABLED),
-            "Discard all processing and return to the original loaded file.\n"
-            "Does not affect the file on disk."
+            "Discard all processing and return to the original loaded file."
         )
         self.btn_reset.pack(side=tk.LEFT, padx=3)
 
@@ -181,22 +172,24 @@ class VinylCleanupApp:
             self.btn_play_orig = tip(
                 ttk.Button(bar, text="Play Original",
                            command=self.play_original, state=tk.DISABLED),
-                "Play back the original unprocessed audio through your default audio device."
+                "Play the original audio.\n\n"
+                "If a preview region is selected, only that region plays — so you\n"
+                "can A/B compare it directly against the processed preview."
             )
             self.btn_play_orig.pack(side=tk.LEFT, padx=3)
 
             self.btn_play_preview = tip(
                 ttk.Button(bar, text="Play Preview",
                            command=self.play_preview, state=tk.DISABLED),
-                "Play back the processed preview region.\n"
-                "Compare it against 'Play Original' to judge whether the settings are working."
+                "Play the processed preview region.\n"
+                "Compare against 'Play Original' — both will play the same time range."
             )
             self.btn_play_preview.pack(side=tk.LEFT, padx=3)
 
             self.btn_play_proc = tip(
                 ttk.Button(bar, text="Play Full Result",
                            command=self.play_processed, state=tk.DISABLED),
-                "Play back the entire full-track processed result."
+                "Play the entire full-track processed result."
             )
             self.btn_play_proc.pack(side=tk.LEFT, padx=3)
 
@@ -211,19 +204,18 @@ class VinylCleanupApp:
         file_frame.pack(fill=tk.X, pady=(0, 6))
         tip(
             ttk.Button(file_frame, text="Load WAV File", command=self.load_file),
-            "Open a WAV file from disk. Stereo and mono are both supported.\n"
-            "The original file is never modified by this program."
+            "Open a WAV file. Stereo and mono are both supported.\n"
+            "The original file is never modified."
         ).pack(fill=tk.X)
 
-        # Region selection controls
         region_frame = ttk.LabelFrame(parent, text="Preview Region", padding=8)
         region_frame.pack(fill=tk.X, pady=(0, 6))
 
         ttk.Label(
             region_frame,
-            text="Click and drag on the top waveform to select a region, "
-                 "or type a range below. Then click 'Process Preview Region' "
-                 "to test your settings quickly.",
+            text="Drag on the top waveform to select a region, or type a "
+                 "range below. 'Play Original' will also respect this region "
+                 "for a direct A/B comparison.",
             foreground="gray", wraplength=210, justify=tk.LEFT, font=("Arial", 8)
         ).pack(anchor=tk.W, pady=(0, 5))
 
@@ -234,21 +226,17 @@ class VinylCleanupApp:
         range_row.pack(fill=tk.X, pady=(4, 0))
         ttk.Label(range_row, text="Start (s):").pack(side=tk.LEFT)
         self.manual_start = tk.DoubleVar(value=0.0)
-        ttk.Spinbox(
-            range_row, from_=0.0, to=99999.0, increment=1.0,
-            textvariable=self.manual_start, width=6, format="%.1f"
-        ).pack(side=tk.LEFT, padx=(2, 8))
+        ttk.Spinbox(range_row, from_=0.0, to=99999.0, increment=1.0,
+                    textvariable=self.manual_start, width=6, format="%.1f").pack(side=tk.LEFT, padx=(2, 8))
         ttk.Label(range_row, text="End (s):").pack(side=tk.LEFT)
         self.manual_end = tk.DoubleVar(value=60.0)
-        ttk.Spinbox(
-            range_row, from_=0.0, to=99999.0, increment=1.0,
-            textvariable=self.manual_end, width=6, format="%.1f"
-        ).pack(side=tk.LEFT, padx=2)
+        ttk.Spinbox(range_row, from_=0.0, to=99999.0, increment=1.0,
+                    textvariable=self.manual_end, width=6, format="%.1f").pack(side=tk.LEFT, padx=2)
 
         tip(
             ttk.Button(region_frame, text="Use Typed Range", command=self._use_typed_range),
-            "Set the preview region to the start/end times you typed above.\n"
-            "For example, set 0 to 60 to test just the first minute."
+            "Set the region to the start/end times above.\n"
+            "Example: 0 to 60 to test just the first minute."
         ).pack(fill=tk.X, pady=(6, 0))
 
         ttk.Button(
@@ -256,7 +244,6 @@ class VinylCleanupApp:
             command=self._clear_region
         ).pack(fill=tk.X, pady=(3, 0))
 
-        # Processing tabs
         nb = ttk.Notebook(parent)
         nb.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
         self._build_tab_clicks(nb)
@@ -282,28 +269,29 @@ class VinylCleanupApp:
         self.do_declick = tk.BooleanVar(value=True)
         tip(
             ttk.Checkbutton(tab, text="Enable De-Click", variable=self.do_declick),
-            "Detects sharp impulse noises (clicks, pops, crackle) by comparing the signal\n"
-            "against a smoothed reference and replacing flagged samples with that reference.\n\n"
-            "Safe to leave on for almost every vinyl transfer. Has no effect on continuous\n"
-            "hiss or hum between clicks — use Spectral Noise Reduction for that."
+            "Detects sharp impulse noises (clicks, pops, crackle) using a second-order\n"
+            "difference detector, which responds to discontinuities rather than amplitude.\n"
+            "This means it does NOT introduce artifacts on high-frequency content.\n\n"
+            "Detected regions are repaired by linear interpolation from the samples\n"
+            "on either side of the click — not replaced with a flat reference.\n\n"
+            "Safe to leave on for virtually every vinyl transfer."
         ).pack(anchor=tk.W)
 
         ttk.Label(
             tab,
             text="Detection Sensitivity\n"
-                 "Higher value = less aggressive (misses subtle clicks)\n"
-                 "Lower value = more aggressive (may soften sharp musical\n"
-                 "transients like snare hits or piano attacks if set too low)",
+                 "Higher = less aggressive (misses subtle clicks)\n"
+                 "Lower = more aggressive (may soften loud transients like snare hits)",
             foreground="gray", font=("Arial", 8), justify=tk.LEFT
         ).pack(anchor=tk.W, pady=(6, 0))
-        self.click_sens = tk.DoubleVar(value=5.0)
-        self._slider_row(tab, self.click_sens, 1.0, 15.0, "{:.1f}")
+        self.click_sens = tk.DoubleVar(value=10.0)
+        self._slider_row(tab, self.click_sens, 1.0, 30.0, "{:.1f}")
 
         ttk.Label(
             tab,
             text="Repair Window (ms)\n"
                  "Width of the region replaced around each detected click.\n"
-                 "1-3ms handles most crackle. Up to 8-10ms for heavy pops.",
+                 "1-3ms handles crackle. Up to 8-10ms for heavy pops.",
             foreground="gray", font=("Arial", 8), justify=tk.LEFT
         ).pack(anchor=tk.W, pady=(5, 0))
         self.click_window = tk.DoubleVar(value=2.0)
@@ -316,20 +304,19 @@ class VinylCleanupApp:
         self.do_noise_reduce = tk.BooleanVar(value=False)
         tip(
             ttk.Checkbutton(tab, text="Enable Noise Reduction", variable=self.do_noise_reduce),
-            "Targets continuous broadband noise (hiss, hum, surface noise) by working in\n"
-            "the frequency domain rather than the time domain.\n\n"
-            "You must capture a noise profile first (see below) before this does anything.\n\n"
-            "Start with Reduction Strength around 2.0 and raise it only if you still hear\n"
-            "noise. Too high (above 4.0) causes a warbling metallic artifact called\n"
-            "'musical noise' that is worse than the original hiss."
+            "Targets continuous broadband noise (hiss, hum, surface noise) in the\n"
+            "frequency domain. Has no effect on clicks — that is what de-click is for.\n\n"
+            "You MUST capture a noise profile first (see below).\n\n"
+            "Start with Reduction Strength around 2.0. Above 4.0 causes a warbling\n"
+            "metallic artifact called 'musical noise' that is worse than the hiss."
         ).pack(anchor=tk.W)
 
         ttk.Label(
             tab,
-            text="Capture a noise profile:\n"
-                 "1. Find a section with no music, only surface noise.\n"
-                 "   The lead-in groove before the music starts is ideal.\n"
-                 "2. Enter the time range below and click Capture.",
+            text="Capture a noise profile first:\n"
+                 "1. Find a section with no music — the lead-in groove before\n"
+                 "   the music starts is ideal (pure surface noise only).\n"
+                 "2. Enter the time range and click Capture.",
             foreground="gray", font=("Arial", 8), justify=tk.LEFT
         ).pack(anchor=tk.W, pady=(6, 2))
 
@@ -346,20 +333,20 @@ class VinylCleanupApp:
 
         tip(
             ttk.Button(tab, text="Capture Noise Profile", command=self.capture_noise_profile),
-            "Analyzes the selected time range and records its frequency signature.\n"
-            "This fingerprint is subtracted from every frame during processing.\n\n"
-            "The profile is taken from the ORIGINAL file, not from any processed result."
+            "Records the frequency fingerprint of the selected region.\n"
+            "This is subtracted from every audio frame during processing.\n"
+            "Always taken from the original file."
         ).pack(fill=tk.X, pady=6)
 
-        self.lbl_noise_profile = ttk.Label(tab, text="No profile captured", foreground="gray",
-                                            font=("Arial", 8))
+        self.lbl_noise_profile = ttk.Label(tab, text="No profile captured",
+                                            foreground="gray", font=("Arial", 8))
         self.lbl_noise_profile.pack(anchor=tk.W)
 
         ttk.Label(
             tab,
             text="Reduction Strength (alpha)\n"
-                 "How aggressively the noise floor is subtracted.\n"
-                 "1.5-3.0 is a good starting range. Above 4.0 introduces artifacts.",
+                 "1.5-3.0 is a good starting range.\n"
+                 "Above 4.0 introduces metallic warbling artifacts.",
             foreground="gray", font=("Arial", 8), justify=tk.LEFT
         ).pack(anchor=tk.W, pady=(8, 0))
         self.noise_alpha = tk.DoubleVar(value=2.0)
@@ -368,9 +355,8 @@ class VinylCleanupApp:
         ttk.Label(
             tab,
             text="Spectral Floor (beta)\n"
-                 "Minimum retained signal per frequency bin. Raising this reduces\n"
-                 "the 'musical noise' warble artifact at the cost of less noise removed.\n"
-                 "Keep between 0.01 and 0.05 for most material.",
+                 "Minimum retained signal per bin. Raise to reduce warbling at\n"
+                 "the cost of slightly less noise removed. Keep 0.01-0.05.",
             foreground="gray", font=("Arial", 8), justify=tk.LEFT
         ).pack(anchor=tk.W, pady=(5, 0))
         self.noise_beta = tk.DoubleVar(value=0.02)
@@ -386,11 +372,10 @@ class VinylCleanupApp:
         tip(
             ttk.Checkbutton(tab, text="Enable Rumble Filter", variable=self.do_rumble),
             "Cuts everything below the cutoff frequency.\n\n"
-            "Turntable motors and tonearm resonance produce low-frequency rumble (typically\n"
-            "5-30 Hz) that you cannot hear but wastes headroom and causes woofer pumping.\n\n"
-            "The default 30 Hz cutoff is safe for virtually all music.\n"
-            "Only raise it if you still hear mechanical noise after processing.\n"
-            "Going above 80 Hz starts cutting audible bass in the music."
+            "Turntable motors produce low-frequency rumble (5-30 Hz) that wastes\n"
+            "headroom and causes woofer pumping. The default 30 Hz cutoff is safe\n"
+            "for virtually all music. Only raise it for severe motor noise.\n"
+            "Going above 80 Hz starts audibly cutting bass in the music."
         ).pack(anchor=tk.W)
 
         ttk.Label(
@@ -407,8 +392,7 @@ class VinylCleanupApp:
         rof = ttk.Frame(tab)
         rof.pack(fill=tk.X)
         for o, desc in ((2, "gentle"), (4, "standard"), (6, "steep"), (8, "very steep")):
-            ttk.Radiobutton(rof, text=f"{o} ({desc})", variable=self.rumble_order,
-                            value=o).pack(anchor=tk.W)
+            ttk.Radiobutton(rof, text=f"{o} ({desc})", variable=self.rumble_order, value=o).pack(anchor=tk.W)
 
         ttk.Separator(tab).pack(fill=tk.X, pady=10)
 
@@ -418,19 +402,17 @@ class VinylCleanupApp:
         tip(
             ttk.Checkbutton(tab, text="Enable Hiss Filter", variable=self.do_hiss),
             "Cuts everything above the cutoff frequency.\n\n"
-            "WARNING: This is a blunt instrument. It will remove high-frequency musical\n"
-            "content (cymbals, string overtones, vocal air, piano upper registers) along\n"
-            "with the hiss.\n\n"
+            "WARNING: This is a blunt cut. It removes high-frequency musical content\n"
+            "(cymbals, string overtones, vocal air) along with the hiss.\n\n"
             "Use Spectral Noise Reduction instead — it is far more targeted.\n"
-            "Only use this filter if you have a specific reason to hard-limit the\n"
-            "high-frequency bandwidth of the recording."
+            "Only enable this if you specifically need a hard bandwidth limit."
         ).pack(anchor=tk.W)
 
         ttk.Label(
             tab,
             text="Cutoff Frequency (Hz)\n"
-                 "14000 Hz and above retains most musical content.\n"
-                 "Below 10000 Hz will audibly dull the recording.",
+                 "14000+ retains most musical content.\n"
+                 "Below 10000 will audibly dull the recording.",
             foreground="gray", font=("Arial", 8), justify=tk.LEFT
         ).pack(anchor=tk.W, pady=(6, 0))
         self.hiss_freq = tk.DoubleVar(value=14000.0)
@@ -441,68 +423,56 @@ class VinylCleanupApp:
         hof = ttk.Frame(tab)
         hof.pack(fill=tk.X)
         for o, desc in ((2, "gentle"), (4, "standard"), (6, "steep"), (8, "very steep")):
-            ttk.Radiobutton(hof, text=f"{o} ({desc})", variable=self.hiss_order,
-                            value=o).pack(anchor=tk.W)
+            ttk.Radiobutton(hof, text=f"{o} ({desc})", variable=self.hiss_order, value=o).pack(anchor=tk.W)
 
     def _build_tab_levels(self, nb):
         tab = ttk.Frame(nb, padding=8)
         nb.add(tab, text="Levels")
 
         ttk.Label(tab, text="DC Offset Removal", font=("Arial", 10, "bold")).pack(anchor=tk.W)
-
         self.do_dc_remove = tk.BooleanVar(value=True)
         tip(
             ttk.Checkbutton(tab, text="Remove DC Offset", variable=self.do_dc_remove),
             "Removes a constant voltage bias from the waveform.\n\n"
-            "Some older phono preamps and analog-to-digital converters introduce a small\n"
-            "DC offset that shifts the entire signal above or below the zero line. This\n"
-            "wastes headroom and causes asymmetric clipping.\n\n"
-            "Removing it is always safe and costs nothing. Leave this on."
+            "Some phono preamps and ADCs shift the signal above or below zero,\n"
+            "wasting headroom and causing asymmetric clipping.\n"
+            "Always safe to leave on."
         ).pack(anchor=tk.W)
 
         ttk.Separator(tab).pack(fill=tk.X, pady=10)
 
         ttk.Label(tab, text="Normalization", font=("Arial", 10, "bold")).pack(anchor=tk.W)
-
         self.do_normalize = tk.BooleanVar(value=True)
         tip(
             ttk.Checkbutton(tab, text="Enable Normalization", variable=self.do_normalize),
-            "Adjusts the overall volume level of the recording.\n\n"
-            "PEAK mode: Finds the loudest sample and scales the whole file so that\n"
-            "sample reaches your target. Safe — never clips. -1.0 dBFS is a good default.\n\n"
-            "RMS mode: Matches perceived loudness to a target average level. Can apply\n"
-            "very large amounts of gain on quiet recordings. A hard +18 dB cap is enforced\n"
-            "but still ALWAYS test with preview first when using RMS mode."
+            "Adjusts the overall volume of the recording.\n\n"
+            "PEAK mode: Scales so the loudest sample hits your target. Always safe.\n\n"
+            "RMS mode: Scales to a target average loudness. Can apply very large\n"
+            "gain on quiet recordings. A hard +18 dB cap is enforced, but always\n"
+            "test with preview before applying to the full track."
         ).pack(anchor=tk.W)
 
         self.norm_mode = tk.StringVar(value="peak")
         tip(
-            ttk.Radiobutton(
-                tab, text="Peak  --  safe, recommended for most transfers",
-                variable=self.norm_mode, value="peak"
-            ),
-            "Scales so the single loudest sample hits your target level.\n"
-            "Always safe. Will never clip. Start here."
+            ttk.Radiobutton(tab, text="Peak  --  safe, recommended",
+                            variable=self.norm_mode, value="peak"),
+            "Scales so the loudest sample hits your target.\n"
+            "Never clips. Start here."
         ).pack(anchor=tk.W, pady=(8, 0))
-
         tip(
-            ttk.Radiobutton(
-                tab, text="RMS  --  perceived loudness matching (use with caution)",
-                variable=self.norm_mode, value="rms"
-            ),
-            "Scales to a target average (RMS) loudness level.\n\n"
-            "Useful when matching levels across multiple sides of a record.\n\n"
-            "CAUTION: Can apply massive gain on quiet recordings or recordings\n"
-            "with long silences. Always use 'Process Preview Region' to check\n"
-            "the result before applying to the full track."
+            ttk.Radiobutton(tab, text="RMS  --  perceived loudness (use with caution)",
+                            variable=self.norm_mode, value="rms"),
+            "Scales to a target average loudness level.\n"
+            "Can apply massive gain on quiet recordings.\n"
+            "ALWAYS preview before applying to full track."
         ).pack(anchor=tk.W)
 
         ttk.Label(
             tab,
             text="Target Level (dBFS)\n"
-                 "Peak mode: -1.0 dBFS leaves 1 dB of headroom (recommended).\n"
-                 "RMS mode: -18 to -14 dBFS is a typical target for vinyl transfers.\n"
-                 "A hard +18 dB gain cap is enforced regardless of mode.",
+                 "Peak: -1.0 dBFS is standard (1 dB headroom).\n"
+                 "RMS: -18 to -14 dBFS is typical for vinyl.\n"
+                 "Hard +18 dB gain cap enforced in both modes.",
             foreground="gray", font=("Arial", 8), justify=tk.LEFT
         ).pack(anchor=tk.W, pady=(8, 0))
         self.norm_target = tk.DoubleVar(value=-1.0)
@@ -511,17 +481,16 @@ class VinylCleanupApp:
         ttk.Separator(tab).pack(fill=tk.X, pady=10)
 
         ttk.Label(tab, text="RIAA De-Emphasis", font=("Arial", 10, "bold")).pack(anchor=tk.W)
-
         self.do_riaa = tk.BooleanVar(value=False)
         tip(
             ttk.Checkbutton(tab, text="Apply RIAA De-Emphasis", variable=self.do_riaa),
-            "Applies the standard vinyl playback equalization curve (IEC 60098).\n\n"
+            "Applies the standard vinyl playback EQ curve (IEC 60098).\n\n"
             "LEAVE THIS OFF in almost every situation.\n\n"
-            "Every standard phono preamp already applies RIAA equalization automatically.\n"
-            "You only need this filter if you connected your cartridge directly to a\n"
-            "line-level input with NO phono preamp — in which case the recording will\n"
-            "sound extremely bass-heavy and dull/muffled.\n\n"
-            "Enabling this on a normally-recorded file will make it sound thin and harsh."
+            "Every standard phono preamp already applies RIAA equalization.\n"
+            "You only need this if you connected your cartridge directly to a\n"
+            "line-level input with NO phono preamp — the recording will sound\n"
+            "extremely bass-heavy and muffled if that is the case.\n\n"
+            "Enabling this on a normally-recorded file makes it sound thin and harsh."
         ).pack(anchor=tk.W)
 
     def _build_right_panel(self, parent):
@@ -530,14 +499,12 @@ class VinylCleanupApp:
         ttk.Label(view_row, text="View:").pack(side=tk.LEFT)
         self.view_mode = tk.StringVar(value="waveform")
         for label, val in (("Waveform", "waveform"), ("Spectrum", "spectrum"), ("Both", "both")):
-            ttk.Radiobutton(
-                view_row, text=label, variable=self.view_mode,
-                value=val, command=self._refresh_plots
-            ).pack(side=tk.LEFT, padx=5)
+            ttk.Radiobutton(view_row, text=label, variable=self.view_mode,
+                            value=val, command=self._refresh_plots).pack(side=tk.LEFT, padx=5)
 
         self.lbl_selection_display = ttk.Label(
             view_row,
-            text="Click and drag on the top waveform to select a preview region",
+            text="Drag on the top waveform to select a preview region",
             foreground="gray", font=("Arial", 8)
         )
         self.lbl_selection_display.pack(side=tk.RIGHT, padx=10)
@@ -550,13 +517,12 @@ class VinylCleanupApp:
         self._init_axes()
 
     # -----------------------------------------------------------------------
-    # AXES / PLOT
+    # AXES / PLOTS
     # -----------------------------------------------------------------------
 
     def _init_axes(self):
         self.fig.clear()
         mode = self.view_mode.get()
-
         if mode == "both":
             axes = self.fig.subplots(2, 2)
             self._ax_ow, self._ax_os = axes[0]
@@ -569,7 +535,6 @@ class VinylCleanupApp:
         self._ax_ow.set_title("Original")
         self._ax_pw.set_title("Processed / Preview")
         self.fig.tight_layout(pad=2.0)
-
         self._attach_span_selector()
         self.canvas.draw()
 
@@ -633,7 +598,7 @@ class VinylCleanupApp:
             except Exception:
                 pass
         self.lbl_region.config(
-            text="No region selected — 'Apply to Full Track' will process the whole file",
+            text="No region selected — full track will be processed",
             foreground="gray"
         )
         self.lbl_selection_display.config(text="No region selected")
@@ -663,15 +628,13 @@ class VinylCleanupApp:
                 self._draw_waveform(lower, self._ax_pw, label)
 
         if mode in ("spectrum", "both"):
-            ax_orig = self._ax_os if mode == "both" else self._ax_ow
-            ax_proc = self._ax_ps if mode == "both" else self._ax_pw
+            ax_o = self._ax_os if mode == "both" else self._ax_ow
+            ax_p = self._ax_ps if mode == "both" else self._ax_pw
             if self.audio_data is not None:
-                self._draw_spectrum(self.audio_data, ax_orig,
-                                    "Original" if mode == "spectrum" else "Spectrum (original)")
+                self._draw_spectrum(self.audio_data, ax_o, "Original" if mode == "spectrum" else "Spectrum (original)")
             lower = self.processed_data if self.processed_data is not None else self.preview_data
             if lower is not None:
-                label = "Processed" if mode == "spectrum" else "Spectrum (processed)"
-                self._draw_spectrum(lower, ax_proc, label)
+                self._draw_spectrum(lower, ax_p, "Processed" if mode == "spectrum" else "Spectrum (processed)")
 
         self.fig.tight_layout(pad=2.0)
         self.canvas.draw()
@@ -681,18 +644,15 @@ class VinylCleanupApp:
         ax.set_title(title, fontsize=9)
         if data is None:
             return
-        target = 60000
-        step = max(1, len(data) // target)
+        step = max(1, len(data) // 60000)
         plot = data[::step]
         t = np.linspace(0, len(data) / self.sample_rate, len(plot))
-
         if plot.ndim > 1:
             ax.plot(t, plot[:, 0], color="#2196F3", alpha=0.7, linewidth=0.4, label="L")
             ax.plot(t, plot[:, 1], color="#FF5722", alpha=0.7, linewidth=0.4, label="R")
             ax.legend(loc="upper right", fontsize=7)
         else:
             ax.plot(t, plot, color="#2196F3", alpha=0.8, linewidth=0.4)
-
         ax.set_xlabel("Time (s)", fontsize=8)
         ax.set_ylabel("Amplitude", fontsize=8)
         ax.grid(True, alpha=0.2)
@@ -757,11 +717,11 @@ class VinylCleanupApp:
             self.btn_reset.config(state=tk.DISABLED)
             self.lbl_noise_profile.config(text="No profile captured", foreground="gray")
             self.lbl_region.config(
-                text="No region selected — 'Apply to Full Track' will process the whole file",
+                text="No region selected — full track will be processed",
                 foreground="gray"
             )
             self.lbl_selection_display.config(
-                text="Click and drag on the top waveform to select a preview region"
+                text="Drag on the top waveform to select a preview region"
             )
 
             if PLAYBACK_AVAILABLE:
@@ -806,7 +766,19 @@ class VinylCleanupApp:
         return data.astype(np.float32)
 
     def play_original(self):
-        self._play_audio(self.audio_data)
+        """
+        If a region is selected, play only that slice of the original so the
+        listener is comparing the same passage as the preview. If no region
+        is selected, play the whole file.
+        """
+        if self.audio_data is None:
+            return
+        if self.region_start is not None and self.region_end is not None:
+            si = int(self.region_start * self.sample_rate)
+            ei = int(self.region_end * self.sample_rate)
+            self._play_audio(self.audio_data[si:ei])
+        else:
+            self._play_audio(self.audio_data)
 
     def play_preview(self):
         if self.preview_data is not None:
@@ -823,9 +795,13 @@ class VinylCleanupApp:
         self.is_playing = True
         self.btn_stop.config(state=tk.NORMAL)
 
+        # Copy to a new array so the playback thread does not share memory
+        # with anything the processing thread might touch.
+        play_buf = np.array(self._to_float32(data), copy=True)
+
         def _run():
             try:
-                sd.play(self._to_float32(data), self.sample_rate)
+                sd.play(play_buf, self.sample_rate)
                 sd.wait()
             except Exception as e:
                 print(f"Playback error: {e}")
@@ -859,7 +835,7 @@ class VinylCleanupApp:
                 messagebox.showerror("Invalid Range", "Start must be less than end.")
                 return
             if s1 > dur:
-                messagebox.showerror("Invalid Range", f"End time exceeds file duration ({dur:.2f}s).")
+                messagebox.showerror("Invalid Range", f"End exceeds file duration ({dur:.2f}s).")
                 return
             if s1 - s0 < 0.1:
                 messagebox.showerror("Invalid Range", "Noise sample must be at least 0.1s long.")
@@ -897,17 +873,59 @@ class VinylCleanupApp:
         return filtfilt(b, a, data)
 
     def _declick(self, ch_data, sensitivity, window_ms):
-        kernel = max(5, int(self.sample_rate * 0.0005) | 1)
-        ref = medfilt(ch_data.astype(np.float64), kernel_size=kernel)
-        residual = ch_data - ref
-        std = np.std(residual)
-        if std == 0:
+        """
+        Click detection via second-order difference (discrete Laplacian).
+
+        WHY: A median-filter residual approach was used previously but has two
+        problems: (1) scipy.signal.medfilt has a known heap-corruption bug that
+        causes crashes after repeated calls, and (2) for a short kernel the
+        median of a high-frequency sinusoid is approximately zero, so the
+        residual contains genuine audio which then gets flagged as clicks and
+        replaced with near-zero values, introducing high-frequency crackle.
+
+        The second-order difference (d2[n] = x[n+1] - 2*x[n] + x[n-1]) is a
+        high-pass operator that responds strongly to sharp discontinuities and
+        weakly to smooth audio content regardless of frequency. It does not
+        require any reference signal and introduces no frequency-dependent bias.
+
+        Detected regions are repaired by linear interpolation from the clean
+        samples on either side, not replaced with a flat reference value.
+        """
+        ch = ch_data.astype(np.float64)
+
+        # Pad by one sample on each end so the diff array is the same length
+        d2 = np.diff(ch, n=2, prepend=[ch[0]], append=[ch[-1]])
+
+        # Robust threshold: median absolute deviation scaled to a sigma equivalent.
+        # MAD is used instead of std because std is heavily influenced by the
+        # clicks themselves, which would raise the threshold and miss them.
+        mad = np.median(np.abs(d2))
+        if mad < 1e-10:
             return ch_data.copy()
-        mask = np.abs(residual) > sensitivity * std
+
+        # 1.4826 is the consistency factor that makes MAD equivalent to sigma
+        # for a Gaussian distribution.
+        threshold = sensitivity * mad * 1.4826
+        mask = np.abs(d2) > threshold
+
+        if not np.any(mask):
+            return ch_data.copy()
+
+        # Dilate the mask to cover the full extent of each impulse
         dilation = max(1, int(self.sample_rate * window_ms / 1000.0))
         mask = binary_dilation(mask, structure=np.ones(dilation, dtype=bool))
-        cleaned = ch_data.copy()
-        cleaned[mask] = ref[mask]
+
+        cleaned = ch.copy()
+        indices = np.arange(len(ch))
+        good = ~mask
+
+        if np.sum(good) < 2:
+            # If almost everything is masked the signal is probably corrupt;
+            # return it untouched rather than interpolating garbage.
+            return ch_data.copy()
+
+        # Linear interpolation across each masked (click) region
+        cleaned[mask] = np.interp(indices[mask], indices[good], ch[good])
         return cleaned
 
     def _spectral_nr(self, ch_data, noise_profile, alpha, beta):
@@ -941,15 +959,11 @@ class VinylCleanupApp:
     def _normalize(self, data, mode, target_dbfs, dtype):
         """
         Normalize with a hard +18 dB gain cap.
-
-        RMS mode on a quiet or sparse recording can otherwise request
-        enormous gain values that clip the output completely. The cap
-        prevents catastrophic results while still allowing meaningful
-        level matching. Always test with preview before applying to the
-        full track when using RMS mode.
+        RMS mode on a quiet or sparse recording would otherwise request
+        enormous gain and clip everything to a solid wall.
         """
         target_lin = 10.0 ** (target_dbfs / 20.0)
-        MAX_GAIN = 10.0 ** (18.0 / 20.0)   # hard ceiling: no more than +18 dB
+        MAX_GAIN = 10.0 ** (18.0 / 20.0)
 
         if dtype == np.int16:
             max_val = 32767.0
@@ -963,7 +977,7 @@ class VinylCleanupApp:
             if current == 0:
                 return data
             scale = (target_lin * max_val) / current
-        else:  # rms
+        else:
             rms = np.sqrt(np.mean(data.astype(np.float64) ** 2))
             if rms == 0:
                 return data
@@ -977,33 +991,19 @@ class VinylCleanupApp:
     # -----------------------------------------------------------------------
 
     def _run_pipeline(self, source_data):
-        """
-        Core DSP pipeline. source_data should be float64 with values
-        in the native range of self.audio_data.dtype.
-        Returns an array cast back to that dtype.
-        """
         data = source_data
         fs = self.sample_rate
         is_stereo = data.ndim > 1
         n_ch = data.shape[1] if is_stereo else 1
         dtype = self.audio_data.dtype
-
         processed_channels = []
 
         for ch in range(n_ch):
             ch_data = data[:, ch].copy() if is_stereo else data.flatten().copy()
             label = f"ch {ch+1}/{n_ch}"
 
-            # Fixed processing order:
-            # 1. DC offset (before all else so filters work on a centered signal)
-            # 2. RIAA (equalization before spectral work)
-            # 3. Rumble HP (remove sub-bass before de-click to reduce false positives)
-            # 4. De-click
-            # 5. Spectral NR
-            # 6. Hiss LP
-
             if self.do_dc_remove.get():
-                self._update_progress(None, f"Removing DC offset ({label})...")
+                self._update_progress(None, f"DC offset removal ({label})...")
                 ch_data -= np.mean(ch_data)
 
             if self.do_riaa.get():
@@ -1035,7 +1035,6 @@ class VinylCleanupApp:
             self._update_progress(None, "Normalizing...")
             result = self._normalize(result, self.norm_mode.get(), self.norm_target.get(), dtype)
 
-        # Clip to safe range and convert back to original dtype
         if dtype == np.int16:
             np.clip(result, -32768, 32767, out=result)
         elif dtype == np.int32:
@@ -1046,11 +1045,9 @@ class VinylCleanupApp:
         return result.astype(dtype)
 
     def _check_steps(self):
-        if not any([
-            self.do_dc_remove.get(), self.do_riaa.get(), self.do_rumble.get(),
-            self.do_declick.get(), self.do_noise_reduce.get(),
-            self.do_hiss.get(), self.do_normalize.get()
-        ]):
+        if not any([self.do_dc_remove.get(), self.do_riaa.get(), self.do_rumble.get(),
+                    self.do_declick.get(), self.do_noise_reduce.get(),
+                    self.do_hiss.get(), self.do_normalize.get()]):
             messagebox.showinfo("Nothing to do", "Enable at least one processing step.")
             return False
         if self.do_noise_reduce.get() and self.noise_profile is None:
@@ -1079,8 +1076,6 @@ class VinylCleanupApp:
             if PLAYBACK_AVAILABLE:
                 self.btn_play_proc.config(state=tk.NORMAL)
 
-    # -- PREVIEW ---
-
     def start_preview(self):
         if self.audio_data is None or not self._check_steps():
             return
@@ -1098,7 +1093,8 @@ class VinylCleanupApp:
             ei = int(e * self.sample_rate)
 
             self._update_progress(10, f"Processing preview ({s:.1f}s - {e:.1f}s)...")
-            segment = self.audio_data[si:ei].astype(np.float64)
+            # Work on an explicit copy so the original array is never touched
+            segment = np.array(self.audio_data[si:ei], dtype=np.float64, copy=True)
             result = self._run_pipeline(segment)
             self.preview_data = result
             self.root.after(0, self._finish_preview)
@@ -1111,11 +1107,9 @@ class VinylCleanupApp:
 
     def _finish_preview(self):
         self._update_progress(100,
-            "Preview done. Play it back and compare. If it sounds good, click 'Apply to Full Track'.")
+            "Preview done. Play and compare. If it sounds right, click 'Apply to Full Track'.")
         self._refresh_plots()
         self._unlock_ui_after("preview")
-
-    # -- FULL TRACK ---
 
     def start_full_processing(self):
         if self.audio_data is None or not self._check_steps():
@@ -1128,7 +1122,7 @@ class VinylCleanupApp:
     def _process_full(self):
         try:
             self._update_progress(5, "Processing full track...")
-            data = self.audio_data.astype(np.float64)
+            data = np.array(self.audio_data, dtype=np.float64, copy=True)
             self.processed_data = self._run_pipeline(data)
             self.preview_data = None
             self.root.after(0, self._finish_full)
@@ -1148,8 +1142,6 @@ class VinylCleanupApp:
             self.progress["value"] = pct
         self.lbl_status.config(text=text)
         self.root.update_idletasks()
-
-    # -- UNDO / RESET ---
 
     def _save_undo(self):
         if self.processed_data is not None:
