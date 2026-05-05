@@ -40,7 +40,7 @@ All processing is non-destructive. The original file is never modified, and ever
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/your-username/vinyl-cleanup.git
+git clone https://github.com/NullAngst/vinyl-cleanup.git
 cd vinyl-cleanup
 ```
 
