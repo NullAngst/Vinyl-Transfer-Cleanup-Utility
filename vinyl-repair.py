@@ -727,9 +727,14 @@ class VinylCleanupApp:
             ttk.Checkbutton(tab, text="Enable Normalization", variable=self.do_normalize),
             "Adjusts the overall volume of the recording.\n\n"
             "PEAK mode: scales so the loudest sample hits your target. Always safe.\n\n"
-            "RMS mode: scales to a target average loudness. Can apply very large\n"
-            f"gain on quiet recordings. A hard +{MAX_NORMALIZATION_GAIN_DB:.0f} dB cap is enforced, but always\n"
-            "test with preview before applying to the full track."
+            "RMS mode: scales to a target average loudness. Two ceilings apply:\n"
+            f"  1. Hard +{MAX_NORMALIZATION_GAIN_DB:.0f} dB max gain cap.\n"
+            "  2. Peak-at-0-dBFS ceiling: the gain is always reduced if it would\n"
+            "     push any sample past full scale. This prevents bass-heavy material\n"
+            "     from clipping even if the RMS target cannot be reached cleanly.\n"
+            "     A warning dialog tells you when this happens.\n\n"
+            "If peak limiting engages and you want a specific loudness, you need\n"
+            "a compressor/limiter — this tool does not include one."
         ).pack(anchor=tk.W)
 
         self.norm_mode = tk.StringVar(value="peak")
@@ -834,8 +839,11 @@ class VinylCleanupApp:
             add("Hiss filter (low-pass)",
                 f"{self.hiss_freq.get():.0f} Hz, order {self.hiss_order.get()}")
         if self.do_normalize.get():
+            note = ""
+            if self.norm_mode.get() == "rms":
+                note = " (peak ceiling enforced — will not clip)"
             add(f"Normalize ({self.norm_mode.get().upper()})",
-                f"target {self.norm_target.get():.1f} dBFS")
+                f"target {self.norm_target.get():.1f} dBFS{note}")
 
         if not steps:
             text = "(no steps enabled — enable at least one)"
@@ -1532,9 +1540,30 @@ class VinylCleanupApp:
 
     def _normalize(self, data, mode, target_dbfs, dtype):
         """
-        Normalize with a hard +18 dB gain cap.
-        RMS mode on a quiet or sparse recording would otherwise request
-        enormous gain and clip everything to a solid wall.
+        Normalize with two hard ceilings:
+          1. +18 dB max gain cap (prevents enormous boost on near-silent files).
+          2. Peak-at-0-dBFS ceiling (prevents RMS mode from clipping bass transients).
+
+        WHY THE SECOND CEILING IS NECESSARY:
+        RMS normalization computes a scale factor based on the average loudness of
+        the signal. For vinyl transfers with high crest factors (loud transient peaks
+        relative to average level — bass-heavy material, dynamic jazz, orchestral
+        recordings), this scale factor can be large enough to push the peaks far above
+        full scale even though it passes the +18 dB cap.
+
+        Example: RMS = 4000 int16 units, target = -3 dBFS, peak = 28000.
+          scale = (0.708 * 32767) / 4000 = 5.8x  (+15.3 dB — within the +18 dB cap)
+          After scaling: peak becomes 28000 * 5.8 = 162,400.
+          Clipped to 32767. Every loud bass hit is a solid wall of distortion.
+
+        The peak ceiling prevents this by ensuring output_peak <= 0 dBFS.
+        If the RMS target cannot be reached without clipping, the gain is reduced
+        until the peak is exactly at 0 dBFS. The status bar shows the actual gain
+        applied so you know when this is happening.
+
+        If you need to match a specific RMS level without clipping, the only
+        correct answer is to reduce the target dBFS until the peak ceiling
+        doesn't engage, or switch to peak normalization.
         """
         target_lin = 10.0 ** (target_dbfs / 20.0)
         max_gain = 10.0 ** (MAX_NORMALIZATION_GAIN_DB / 20.0)
@@ -1546,19 +1575,31 @@ class VinylCleanupApp:
         else:
             max_val = 1.0
 
+        peak = float(np.max(np.abs(data)))
+        if peak == 0:
+            return data, 0.0, False
+
         if mode == "peak":
-            current = float(np.max(np.abs(data)))
-            if current == 0:
-                return data
-            scale = (target_lin * max_val) / current
+            scale = (target_lin * max_val) / peak
         else:
             rms = float(np.sqrt(np.mean(data.astype(np.float64) ** 2)))
             if rms == 0:
-                return data
+                return data, 0.0, False
             scale = (target_lin * max_val) / rms
 
+        # Ceiling 1: hard max-gain cap
         scale = min(scale, max_gain)
-        return data * scale
+
+        # Ceiling 2: peak must never exceed 0 dBFS full scale.
+        # This is what prevents bass transients from clipping in RMS mode.
+        # For peak mode this ceiling is always ≥ the computed scale (since
+        # we target ≤ 0 dBFS by definition), so it has no effect there.
+        peak_ceiling = max_val / peak
+        peak_was_capped = scale > peak_ceiling
+        scale = min(scale, peak_ceiling)
+
+        gain_db = 20.0 * np.log10(max(scale, 1e-10))
+        return data * scale, gain_db, peak_was_capped
 
     # -----------------------------------------------------------------------
     # PROCESSING PIPELINE
@@ -1646,10 +1687,13 @@ class VinylCleanupApp:
         result = (np.column_stack(processed_channels)
                   if is_stereo else processed_channels[0])
 
+        norm_gain_db = None
+        norm_peak_capped = False
         if self.do_normalize.get():
             self._update_progress(progress_offset + progress_span - 2, "Normalizing...")
-            result = self._normalize(result, self.norm_mode.get(),
-                                     self.norm_target.get(), dtype)
+            result, norm_gain_db, norm_peak_capped = self._normalize(
+                result, self.norm_mode.get(), self.norm_target.get(), dtype
+            )
 
         # Clip to dtype range. For floats clip to [-1, 1] only when the input
         # was already in that convention.
@@ -1663,7 +1707,7 @@ class VinylCleanupApp:
             if np.max(np.abs(self.audio_data)) <= 1.0:
                 np.clip(result, -1.0, 1.0, out=result)
 
-        return result.astype(dtype), total_clicks
+        return result.astype(dtype), total_clicks, norm_gain_db, norm_peak_capped
 
     def _check_steps(self):
         """Return True if processing should proceed, else False.
@@ -1756,11 +1800,12 @@ class VinylCleanupApp:
             self._update_progress(5, f"Processing preview ({s:.2f}s – {e:.2f}s)...")
             # Work on an explicit copy so the original array is never touched
             segment = np.array(self.audio_data[si:ei], dtype=np.float64, copy=True)
-            result, n_clicks = self._run_pipeline(segment,
-                                                  progress_offset=5,
-                                                  progress_span=85)
+            result, n_clicks, norm_gain_db, norm_peak_capped = self._run_pipeline(
+                segment, progress_offset=5, progress_span=85
+            )
             self.preview_data = result
-            self.root.after(0, lambda: self._finish_preview(n_clicks))
+            self.root.after(0, lambda: self._finish_preview(n_clicks, norm_gain_db,
+                                                             norm_peak_capped))
 
         except Exception as exc:
             err = f"{exc}\n\n{traceback.format_exc()}"
@@ -1768,12 +1813,30 @@ class VinylCleanupApp:
             self.root.after(0, lambda: self._update_progress(0, "Preview failed."))
             self.root.after(0, lambda: self._unlock_ui_after("preview"))
 
-    def _finish_preview(self, n_clicks=0):
-        msg = "Preview done. Play and compare. If it sounds right, click 'Apply to Full Track'."
+    def _finish_preview(self, n_clicks=0, norm_gain_db=None, norm_peak_capped=False):
+        parts = ["Preview done."]
         if self.do_declick.get() and n_clicks > 0:
-            msg = f"Preview done. {n_clicks} click(s) repaired in this region. " \
-                  "Play and compare."
+            parts.append(f"{n_clicks} click(s) repaired.")
+        if norm_gain_db is not None:
+            parts.append(f"Gain applied: {norm_gain_db:+.1f} dB.")
+        if norm_peak_capped:
+            parts.append(
+                "WARNING: RMS target required more gain than the peak ceiling allows "
+                "— gain was reduced to prevent clipping. Lower the RMS target or "
+                "switch to Peak mode."
+            )
+        msg = " ".join(parts) + " Play and compare. If it sounds right, click 'Apply to Full Track'."
         self._update_progress(100, msg)
+        if norm_peak_capped:
+            self.root.after(0, lambda: messagebox.showwarning(
+                "Normalization gain capped",
+                "The RMS normalization target you set would have clipped the audio.\n\n"
+                "The gain was automatically reduced so the loudest peak stays at 0 dBFS "
+                "instead of clipping.\n\n"
+                "To reach your target RMS level without clipping, you would need to apply "
+                "dynamic compression (not included in this tool).\n\n"
+                "Alternatively, lower your RMS target, or switch to Peak normalization."
+            ))
         self._refresh_plots()
         self._unlock_ui_after("preview")
 
@@ -1802,23 +1865,39 @@ class VinylCleanupApp:
         try:
             self._update_progress(5, "Processing full track...")
             data = np.array(self.audio_data, dtype=np.float64, copy=True)
-            result, n_clicks = self._run_pipeline(data,
-                                                  progress_offset=5,
-                                                  progress_span=90)
+            result, n_clicks, norm_gain_db, norm_peak_capped = self._run_pipeline(
+                data, progress_offset=5, progress_span=90
+            )
             self.processed_data = result
             self.preview_data = None
-            self.root.after(0, lambda: self._finish_full(n_clicks))
+            self.root.after(0, lambda: self._finish_full(n_clicks, norm_gain_db,
+                                                          norm_peak_capped))
         except Exception as exc:
             err = f"{exc}\n\n{traceback.format_exc()}"
             self.root.after(0, lambda: messagebox.showerror("Processing Error", err))
             self.root.after(0, lambda: self._update_progress(0, "Processing failed."))
             self.root.after(0, lambda: self._unlock_ui_after("full"))
 
-    def _finish_full(self, n_clicks=0):
-        msg = "Full track done. Click 'Save Processed WAV' to export."
+    def _finish_full(self, n_clicks=0, norm_gain_db=None, norm_peak_capped=False):
+        parts = ["Full track done."]
         if self.do_declick.get() and n_clicks > 0:
-            msg = f"Full track done. {n_clicks} click(s) repaired total. Click 'Save Processed WAV' to export."
-        self._update_progress(100, msg)
+            parts.append(f"{n_clicks} click(s) repaired.")
+        if norm_gain_db is not None:
+            parts.append(f"Gain applied: {norm_gain_db:+.1f} dB.")
+        if norm_peak_capped:
+            parts.append("Gain was peak-capped — see warning.")
+        parts.append("Click 'Save Processed WAV' to export.")
+        self._update_progress(100, " ".join(parts))
+        if norm_peak_capped:
+            self.root.after(0, lambda: messagebox.showwarning(
+                "Normalization gain capped",
+                "The RMS normalization target you set would have clipped the audio.\n\n"
+                "The gain was automatically reduced so the loudest peak stays at 0 dBFS "
+                "instead of clipping.\n\n"
+                "To reach your target RMS level without clipping, you would need to apply "
+                "dynamic compression (not included in this tool).\n\n"
+                "Alternatively, lower your RMS target, or switch to Peak normalization."
+            ))
         self._refresh_plots()
         self._unlock_ui_after("full")
 
